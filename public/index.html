@@ -167,6 +167,12 @@
     text-transform:uppercase;
     letter-spacing:0.03em;
   }
+  .item-snippet{
+    font-size:14px;
+    color:#3A3F55;
+    margin-top:6px;
+    line-height:1.45;
+  }
   .item-meta .area-tag{
     background:var(--ink);
     color:var(--signal);
@@ -342,6 +348,7 @@
         li.className = 'item';
         li.innerHTML = `
           <a href="${i.link}" target="_blank" rel="noopener">${i.title}</a>
+          ${i.snippet ? `<div class="item-snippet">${i.snippet}</div>` : ''}
           <div class="item-meta"><span class="area-tag">${i.area}</span>${i.source || 'Source'} &middot; ${timeAgo(i.publishedAt)}</div>
         `;
         feed.appendChild(li);

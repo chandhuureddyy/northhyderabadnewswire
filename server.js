@@ -147,12 +147,20 @@ async function fetchGoogleCse(query, dateRestrictDays) {
 // /tag/some-topic listing, whose page title is just the tag name) and
 // generic feed titles (e.g. "Latest News - Telangana Today", which is the
 // feed's own name, not a headline).
-const JUNK_URL_PATTERN = /\/(tag|tags|topic|topics|category|categories|author|authors|section)\//i;
+const JUNK_URL_PATTERN = /\/(tag|tags|topic|topics|category|categories|author|authors|section|epaper|e-paper)\//i;
 const JUNK_TITLE_PATTERNS = [
   /^latest news\b/i,
   /^home\s*-/i,
   /^[a-z0-9]+(-[a-z0-9]+){1,}$/i // a bare url-slug used as the title, e.g. "sahiti-group"
 ];
+
+// "X - X" (source name repeated as the title, e.g. wire-service
+// placeholders like "United News of India - United News of India")
+function isRepeatedSourceTitle(title) {
+  const parts = title.split(" - ");
+  if (parts.length !== 2) return false;
+  return parts[0].trim().toLowerCase() === parts[1].trim().toLowerCase();
+}
 
 function isJunk(item) {
   let link = item.link || "";
@@ -161,8 +169,10 @@ function isJunk(item) {
   } catch {
     // leave as-is if decoding fails
   }
-  if (link && JUNK_URL_PATTERN.test(link)) return true;
-  if (item.title && JUNK_TITLE_PATTERNS.some((p) => p.test(item.title.trim()))) return true;
+  if (link && (JUNK_URL_PATTERN.test(link) || /epaper\./i.test(link))) return true;
+  const title = (item.title || "").trim();
+  if (JUNK_TITLE_PATTERNS.some((p) => p.test(title))) return true;
+  if (isRepeatedSourceTitle(title)) return true;
   return false;
 }
 
@@ -218,14 +228,36 @@ async function fetchAllAreas() {
 
 // ---------- Upcoming events pipeline ----------
 // Not a structured government events calendar (no public API for that
-// exists) -- this is keyword-matched against recent news/search text, so
-// it surfaces announcements phrased in an event-like way (inaugurations,
-// openings, notices, schedules). It can miss events nobody's written
-// about yet, and can surface things where the exact date isn't in the
-// snippet -- always treat it as "leads to check", not a verified calendar.
+// exists) -- this is keyword-matched against recent news/search text.
+// Journalism habitually uses present tense for things that JUST happened
+// ("X inaugurates new facility" = already done), so topic keywords alone
+// (metro, launch, notice...) mostly surfaced past coverage, not upcoming
+// items. This requires an actual future-tense phrase to match, and then
+// drops anything that also reads as a completed action.
 
 const EVENT_KEYWORDS =
-  '(inaugurat* OR "grand opening" OR "new opening" OR "coming soon" OR launch OR event OR schedule OR notice OR GHMC OR HMDA OR "public meeting" OR flyover OR metro)';
+  '("to be inaugurated" OR "will be inaugurated" OR "set to open" OR "slated to open" OR "will open" OR "to open soon" OR "coming soon" OR "scheduled to be held" OR "scheduled for" OR "to be held" OR "will be held" OR "upcoming event" OR "public notice" OR "tender notice" OR "GHMC notification" OR "HMDA notification")';
+
+// If a result also contains clearly-completed-action language, it's
+// describing something that already happened, regardless of which future
+// phrase above got it matched (e.g. quoting past context in an otherwise
+// unrelated article). Drop it.
+const PAST_TENSE_EXCLUDE = [
+  /\binaugurat(es|ed)\b/i,
+  /\blaunch(es|ed)\b/i,
+  /\bopen(s|ed)\b(?!\s+soon)/i,
+  /\bunveil(s|ed)\b/i,
+  /\bcommission(s|ed)\b/i,
+  /\bwas held\b/i,
+  /\bwere held\b/i,
+  /\bcompletes?\b/i,
+  /\bcompleted\b/i,
+  /\bheld (on|at|in)\b/i
+];
+
+function isPastTense(title) {
+  return PAST_TENSE_EXCLUDE.some((p) => p.test(title || ""));
+}
 
 async function fetchAllEvents() {
   const results = [];
@@ -249,7 +281,7 @@ async function fetchAllEvents() {
     await new Promise((r) => setTimeout(r, 250));
   }
 
-  const deduped = dedupe(results);
+  const deduped = dedupe(results).filter((i) => !isPastTense(i.title));
   const fresh = withinDays(deduped, freshDays);
   fresh.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
   return fresh;

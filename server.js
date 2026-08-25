@@ -142,10 +142,35 @@ async function fetchGoogleCse(query, dateRestrictDays) {
   }
 }
 
+// Filters out things that technically matched the search but aren't real,
+// dated articles -- tag/category archive pages (e.g. a site's
+// /tag/some-topic listing, whose page title is just the tag name) and
+// generic feed titles (e.g. "Latest News - Telangana Today", which is the
+// feed's own name, not a headline).
+const JUNK_URL_PATTERN = /\/(tag|tags|topic|topics|category|categories|author|authors|section)\//i;
+const JUNK_TITLE_PATTERNS = [
+  /^latest news\b/i,
+  /^home\s*-/i,
+  /^[a-z0-9]+(-[a-z0-9]+){1,}$/i // a bare url-slug used as the title, e.g. "sahiti-group"
+];
+
+function isJunk(item) {
+  let link = item.link || "";
+  try {
+    link = decodeURIComponent(link); // Bing wraps real URLs inside apiclick.aspx?...&url=<encoded>
+  } catch {
+    // leave as-is if decoding fails
+  }
+  if (link && JUNK_URL_PATTERN.test(link)) return true;
+  if (item.title && JUNK_TITLE_PATTERNS.some((p) => p.test(item.title.trim()))) return true;
+  return false;
+}
+
 function dedupe(items) {
   const seenKeys = new Set();
   const out = [];
   for (const item of items) {
+    if (isJunk(item)) continue;
     const key = item.link || item.title;
     if (!key || seenKeys.has(key)) continue;
     seenKeys.add(key);

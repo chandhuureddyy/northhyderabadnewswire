@@ -188,6 +188,33 @@
     font-size:13px;
   }
 
+  .events-section{
+    margin-top:44px;
+  }
+  .ig-heading{
+    font-family:'Oswald', sans-serif;
+    text-transform:uppercase;
+    font-size:20px;
+    letter-spacing:0.02em;
+    margin:0 0 6px;
+    border-bottom:2px solid var(--ink);
+    padding-bottom:8px;
+  }
+  .ig-heading span{
+    color:var(--ink-2);
+    font-family:'JetBrains Mono', monospace;
+    font-size:12px;
+    text-transform:none;
+    letter-spacing:0;
+  }
+  .events-note{
+    font-family:'JetBrains Mono', monospace;
+    font-size:11px;
+    color:var(--ink-2);
+    margin:8px 0 16px;
+    line-height:1.5;
+  }
+
   .subscribe-panel{
     margin-top:44px;
     background:var(--ink);
@@ -279,6 +306,12 @@
 
   <ul class="feed" id="feed"></ul>
 
+  <section class="events-section" id="eventsSection">
+    <h2 class="ig-heading">Upcoming in North Hyderabad <span>(next ~7 days)</span></h2>
+    <p class="events-note">Matched from recent announcements mentioning openings, events, or government notices — not a verified calendar. Always confirm exact dates via the linked source.</p>
+    <ul class="feed" id="eventsFeed"></ul>
+  </section>
+
   <section class="subscribe-panel">
     <h2>Get email alerts</h2>
     <p>Leave your email and you'll get a digest whenever fresh news breaks in North Hyderabad. No spam &mdash; only new items since your last alert.</p>
@@ -331,6 +364,17 @@
     return Math.floor(diff/86400) + 'd ago';
   }
 
+  function renderCard(i){
+    const li = document.createElement('li');
+    li.className = 'item';
+    li.innerHTML = `
+      <a href="${i.link}" target="_blank" rel="noopener">${i.title}</a>
+      ${i.snippet ? `<div class="item-snippet">${i.snippet}</div>` : ''}
+      <div class="item-meta"><span class="area-tag">${i.area}</span>${i.source || 'Source'} &middot; ${timeAgo(i.publishedAt)}</div>
+    `;
+    return li;
+  }
+
   async function loadFeed(){
     const status = document.getElementById('statusLine');
     status.textContent = 'Loading feed…';
@@ -343,19 +387,26 @@
     if(!items.length){
       feed.innerHTML = '<div class="empty">No articles yet. Hit "Refresh now" to fetch the latest.</div>';
     } else {
-      items.forEach(i=>{
-        const li = document.createElement('li');
-        li.className = 'item';
-        li.innerHTML = `
-          <a href="${i.link}" target="_blank" rel="noopener">${i.title}</a>
-          ${i.snippet ? `<div class="item-snippet">${i.snippet}</div>` : ''}
-          <div class="item-meta"><span class="area-tag">${i.area}</span>${i.source || 'Source'} &middot; ${timeAgo(i.publishedAt)}</div>
-        `;
-        feed.appendChild(li);
-      });
+      items.forEach(i=> feed.appendChild(renderCard(i)));
     }
     status.textContent = items.length + ' articles &middot; updated ' + new Date().toLocaleTimeString('en-IN');
     status.innerHTML = status.textContent.replace('&middot;','·');
+  }
+
+  async function loadEvents(){
+    try{
+      const res = await fetch('/api/events');
+      const items = await res.json();
+      const feed = document.getElementById('eventsFeed');
+      feed.innerHTML = '';
+      if(!items.length){
+        feed.innerHTML = '<div class="empty">Nothing matched this week yet.</div>';
+      } else {
+        items.forEach(i=> feed.appendChild(renderCard(i)));
+      }
+    }catch(err){
+      // events section is best-effort -- fail silently, news feed still works
+    }
   }
 
   document.getElementById('refreshBtn').onclick = async ()=>{
@@ -387,6 +438,7 @@
   };
 
   loadAreas().then(loadFeed);
+  loadEvents();
 </script>
 </body>
 </html>

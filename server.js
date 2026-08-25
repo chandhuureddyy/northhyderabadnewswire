@@ -92,15 +92,79 @@ async function fetchNewsApiForArea(area) {
   }
 }
 
+async function fetchBingNewsForArea(area) {
+  const url = `https://www.bing.com/news/search?q=${encodeURIComponent(
+    area.query
+  )}&format=rss&setmkt=en-IN`;
+
+  try {
+    const feed = await parser.parseURL(url);
+    return (feed.items || []).map((item) => ({
+      title: item.title,
+      link: item.link,
+      source: item.source || item.creator || "Bing News",
+      publishedAt: item.pubDate ? new Date(item.pubDate).toISOString() : null,
+      area: area.label,
+      areaId: area.id,
+      provider: "bing-news-rss"
+    }));
+  } catch (err) {
+    console.error(`[bing-news] ${area.label} failed:`, err.message);
+    return [];
+  }
+}
+
+// Optional: Google Custom Search JSON API -- this is the closest match to
+// "search like on Google": returns whatever's actually indexed (news,
+// blogs, forums, official notices, PDFs), with a visible snippet, not
+// just articles tagged as "News" by Google News. Free tier: 100
+// queries/day. Only runs if GOOGLE_CSE_KEY + GOOGLE_CSE_CX are set.
+async function fetchGoogleCseForArea(area) {
+  const key = process.env.GOOGLE_CSE_KEY;
+  const cx = process.env.GOOGLE_CSE_CX;
+  if (!key || !cx) return [];
+
+  try {
+    const resp = await axios.get("https://www.googleapis.com/customsearch/v1", {
+      params: {
+        key,
+        cx,
+        q: area.query,
+        num: 10,
+        dateRestrict: `d${Number(process.env.NEWS_WINDOW_DAYS || 15)}` // Google's own recency filter
+      },
+      timeout: 10000
+    });
+    return (resp.data.items || []).map((item) => ({
+      title: item.title,
+      link: item.link,
+      source: item.displayLink || "Web",
+      snippet: item.snippet || "",
+      // Google CSE doesn't return a reliable publish date for most pages;
+      // leave publishedAt null so the 15-day dateRestrict above is what
+      // actually governs recency for this provider, not the sort step below.
+      publishedAt: null,
+      area: area.label,
+      areaId: area.id,
+      provider: "google-cse"
+    }));
+  } catch (err) {
+    console.error(`[google-cse] ${area.label} failed:`, err.response?.data?.error?.message || err.message);
+    return [];
+  }
+}
+
 async function fetchAllAreas() {
   const results = [];
   for (const area of AREAS) {
-    const [googleItems, newsApiItems] = await Promise.all([
+    const [googleItems, bingItems, newsApiItems, cseItems] = await Promise.all([
       fetchGoogleNewsForArea(area),
-      fetchNewsApiForArea(area)
+      fetchBingNewsForArea(area),
+      fetchNewsApiForArea(area),
+      fetchGoogleCseForArea(area)
     ]);
-    results.push(...googleItems, ...newsApiItems);
-    // small stagger so we don't hammer google in a tight loop
+    results.push(...googleItems, ...bingItems, ...newsApiItems, ...cseItems);
+    // small stagger so we don't hammer any single provider in a tight loop
     await new Promise((r) => setTimeout(r, 250));
   }
 
@@ -114,8 +178,17 @@ async function fetchAllAreas() {
     deduped.push(item);
   }
 
-  deduped.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
-  return deduped;
+  // Confine to the last N days. Items with no publishedAt (e.g. some CSE
+  // results) are kept -- their recency was already enforced by CSE's own
+  // dateRestrict param above, not this sort/filter.
+  const windowDays = Number(process.env.NEWS_WINDOW_DAYS || 15);
+  const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+  const withinWindow = deduped.filter(
+    (item) => !item.publishedAt || new Date(item.publishedAt).getTime() >= cutoff
+  );
+
+  withinWindow.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
+  return withinWindow;
 }
 
 // ---------- Email ----------

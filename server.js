@@ -8,6 +8,7 @@ const nodemailer = require("nodemailer");
 const Parser = require("rss-parser");
 
 const AREAS = require("./areas");
+const PRIORITY_DOMAINS = require("./priority-sources");
 
 const app = express();
 app.use(express.json());
@@ -20,10 +21,11 @@ const parser = new Parser({
 const DATA_DIR = path.join(__dirname, "data");
 const SEEN_FILE = path.join(DATA_DIR, "seen.json");
 const LATEST_FILE = path.join(DATA_DIR, "latest.json");
+const EVENTS_FILE = path.join(DATA_DIR, "events.json");
 const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
-for (const f of [SEEN_FILE, LATEST_FILE, SUBSCRIBERS_FILE]) {
+for (const f of [SEEN_FILE, LATEST_FILE, EVENTS_FILE, SUBSCRIBERS_FILE]) {
   if (!fs.existsSync(f)) fs.writeFileSync(f, "[]");
 }
 
@@ -38,11 +40,11 @@ function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-// ---------- Fetchers ----------
+// ---------- Fetchers (generic: take a raw query string) ----------
 
-async function fetchGoogleNewsForArea(area) {
+async function fetchGoogleNews(query) {
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(
-    area.query
+    query
   )}&hl=en-IN&gl=IN&ceid=IN:en`;
 
   try {
@@ -52,49 +54,17 @@ async function fetchGoogleNewsForArea(area) {
       link: item.link,
       source: (item.title && item.title.split(" - ").pop()) || "Google News",
       publishedAt: item.pubDate ? new Date(item.pubDate).toISOString() : null,
-      area: area.label,
-      areaId: area.id,
       provider: "google-news-rss"
     }));
   } catch (err) {
-    console.error(`[google-news] ${area.label} failed:`, err.message);
+    console.error(`[google-news] "${query}" failed:`, err.message);
     return [];
   }
 }
 
-async function fetchNewsApiForArea(area) {
-  const key = process.env.NEWSAPI_KEY;
-  if (!key) return [];
-
-  try {
-    const resp = await axios.get("https://newsapi.org/v2/everything", {
-      params: {
-        q: area.query,
-        language: "en",
-        sortBy: "publishedAt",
-        pageSize: 15,
-        apiKey: key
-      },
-      timeout: 10000
-    });
-    return (resp.data.articles || []).map((a) => ({
-      title: a.title,
-      link: a.url,
-      source: a.source?.name || "NewsAPI",
-      publishedAt: a.publishedAt,
-      area: area.label,
-      areaId: area.id,
-      provider: "newsapi"
-    }));
-  } catch (err) {
-    console.error(`[newsapi] ${area.label} failed:`, err.message);
-    return [];
-  }
-}
-
-async function fetchBingNewsForArea(area) {
+async function fetchBingNews(query) {
   const url = `https://www.bing.com/news/search?q=${encodeURIComponent(
-    area.query
+    query
   )}&format=rss&setmkt=en-IN`;
 
   try {
@@ -104,22 +74,42 @@ async function fetchBingNewsForArea(area) {
       link: item.link,
       source: item.source || item.creator || "Bing News",
       publishedAt: item.pubDate ? new Date(item.pubDate).toISOString() : null,
-      area: area.label,
-      areaId: area.id,
       provider: "bing-news-rss"
     }));
   } catch (err) {
-    console.error(`[bing-news] ${area.label} failed:`, err.message);
+    console.error(`[bing-news] "${query}" failed:`, err.message);
     return [];
   }
 }
 
-// Optional: Google Custom Search JSON API -- this is the closest match to
-// "search like on Google": returns whatever's actually indexed (news,
-// blogs, forums, official notices, PDFs), with a visible snippet, not
-// just articles tagged as "News" by Google News. Free tier: 100
-// queries/day. Only runs if GOOGLE_CSE_KEY + GOOGLE_CSE_CX are set.
-async function fetchGoogleCseForArea(area) {
+async function fetchNewsApi(query) {
+  const key = process.env.NEWSAPI_KEY;
+  if (!key) return [];
+
+  try {
+    const resp = await axios.get("https://newsapi.org/v2/everything", {
+      params: { q: query, language: "en", sortBy: "publishedAt", pageSize: 15, apiKey: key },
+      timeout: 10000
+    });
+    return (resp.data.articles || []).map((a) => ({
+      title: a.title,
+      link: a.url,
+      source: a.source?.name || "NewsAPI",
+      publishedAt: a.publishedAt,
+      provider: "newsapi"
+    }));
+  } catch (err) {
+    console.error(`[newsapi] "${query}" failed:`, err.message);
+    return [];
+  }
+}
+
+// Optional: Google Custom Search JSON API -- the closest match to "search
+// like on Google": returns whatever's actually indexed (news, blogs,
+// forums, official notices, PDFs), with a visible snippet, not just
+// articles tagged as "News" by Google News. Free tier: 100 queries/day.
+// Only runs if GOOGLE_CSE_KEY + GOOGLE_CSE_CX are set.
+async function fetchGoogleCse(query, dateRestrictDays) {
   const key = process.env.GOOGLE_CSE_KEY;
   const cx = process.env.GOOGLE_CSE_CX;
   if (!key || !cx) return [];
@@ -129,9 +119,9 @@ async function fetchGoogleCseForArea(area) {
       params: {
         key,
         cx,
-        q: area.query,
+        q: query,
         num: 10,
-        dateRestrict: `d${Number(process.env.NEWS_WINDOW_DAYS || 15)}` // Google's own recency filter
+        dateRestrict: `d${dateRestrictDays}` // Google's own recency filter
       },
       timeout: 10000
     });
@@ -141,54 +131,103 @@ async function fetchGoogleCseForArea(area) {
       source: item.displayLink || "Web",
       snippet: item.snippet || "",
       // Google CSE doesn't return a reliable publish date for most pages;
-      // leave publishedAt null so the 15-day dateRestrict above is what
-      // actually governs recency for this provider, not the sort step below.
+      // leave publishedAt null -- dateRestrict above is what actually
+      // governs recency for this provider, not the window filter below.
       publishedAt: null,
-      area: area.label,
-      areaId: area.id,
       provider: "google-cse"
     }));
   } catch (err) {
-    console.error(`[google-cse] ${area.label} failed:`, err.response?.data?.error?.message || err.message);
+    console.error(`[google-cse] "${query}" failed:`, err.response?.data?.error?.message || err.message);
     return [];
   }
 }
 
-async function fetchAllAreas() {
-  const results = [];
-  for (const area of AREAS) {
-    const [googleItems, bingItems, newsApiItems, cseItems] = await Promise.all([
-      fetchGoogleNewsForArea(area),
-      fetchBingNewsForArea(area),
-      fetchNewsApiForArea(area),
-      fetchGoogleCseForArea(area)
-    ]);
-    results.push(...googleItems, ...bingItems, ...newsApiItems, ...cseItems);
-    // small stagger so we don't hammer any single provider in a tight loop
-    await new Promise((r) => setTimeout(r, 250));
-  }
-
-  // Dedup by link (fallback to title) across all areas/providers
+function dedupe(items) {
   const seenKeys = new Set();
-  const deduped = [];
-  for (const item of results) {
+  const out = [];
+  for (const item of items) {
     const key = item.link || item.title;
     if (!key || seenKeys.has(key)) continue;
     seenKeys.add(key);
-    deduped.push(item);
+    out.push(item);
+  }
+  return out;
+}
+
+function withinDays(items, days) {
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  return items.filter((item) => !item.publishedAt || new Date(item.publishedAt).getTime() >= cutoff);
+}
+
+// ---------- News pipeline ----------
+
+async function fetchAllAreas() {
+  const results = [];
+  const windowDays = Number(process.env.NEWS_WINDOW_DAYS || 15);
+  const priorityQuerySuffix = `(site:${PRIORITY_DOMAINS.join(" OR site:")})`;
+
+  for (const area of AREAS) {
+    const [general, bing, newsApi, cse, priorityGoogle, priorityBing] = await Promise.all([
+      fetchGoogleNews(area.query),
+      fetchBingNews(area.query),
+      fetchNewsApi(area.query),
+      fetchGoogleCse(area.query, windowDays),
+      fetchGoogleNews(`${area.query} ${priorityQuerySuffix}`),
+      fetchBingNews(`${area.query} ${priorityQuerySuffix}`)
+    ]);
+
+    const tagged = [...general, ...bing, ...newsApi, ...cse, ...priorityGoogle, ...priorityBing].map((i) => ({
+      ...i,
+      area: area.label,
+      areaId: area.id
+    }));
+    results.push(...tagged);
+    await new Promise((r) => setTimeout(r, 250)); // small stagger between areas
   }
 
-  // Confine to the last N days. Items with no publishedAt (e.g. some CSE
-  // results) are kept -- their recency was already enforced by CSE's own
-  // dateRestrict param above, not this sort/filter.
-  const windowDays = Number(process.env.NEWS_WINDOW_DAYS || 15);
-  const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000;
-  const withinWindow = deduped.filter(
-    (item) => !item.publishedAt || new Date(item.publishedAt).getTime() >= cutoff
-  );
+  const deduped = dedupe(results);
+  const inWindow = withinDays(deduped, windowDays);
+  inWindow.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
+  return inWindow;
+}
 
-  withinWindow.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
-  return withinWindow;
+// ---------- Upcoming events pipeline ----------
+// Not a structured government events calendar (no public API for that
+// exists) -- this is keyword-matched against recent news/search text, so
+// it surfaces announcements phrased in an event-like way (inaugurations,
+// openings, notices, schedules). It can miss events nobody's written
+// about yet, and can surface things where the exact date isn't in the
+// snippet -- always treat it as "leads to check", not a verified calendar.
+
+const EVENT_KEYWORDS =
+  '(inaugurat* OR "grand opening" OR "new opening" OR "coming soon" OR launch OR event OR schedule OR notice OR GHMC OR HMDA OR "public meeting" OR flyover OR metro)';
+
+async function fetchAllEvents() {
+  const results = [];
+  const freshDays = Number(process.env.EVENTS_LOOKBACK_DAYS || 7); // how recent the *announcement* must be
+  const cseDays = Math.min(freshDays, 15); // CSE dateRestrict is capped sensibly here too
+
+  for (const area of AREAS) {
+    const query = `${area.query} ${EVENT_KEYWORDS}`;
+    const [google, bing, cse] = await Promise.all([
+      fetchGoogleNews(query),
+      fetchBingNews(query),
+      fetchGoogleCse(query, cseDays)
+    ]);
+
+    const tagged = [...google, ...bing, ...cse].map((i) => ({
+      ...i,
+      area: area.label,
+      areaId: area.id
+    }));
+    results.push(...tagged);
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  const deduped = dedupe(results);
+  const fresh = withinDays(deduped, freshDays);
+  fresh.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
+  return fresh;
 }
 
 // ---------- Email ----------
@@ -260,6 +299,7 @@ async function sendDigest(newItems) {
 // ---------- Core refresh cycle ----------
 
 let isRefreshing = false;
+let isRefreshingEvents = false;
 
 async function runRefresh() {
   if (isRefreshing) return readJSON(LATEST_FILE);
@@ -285,6 +325,20 @@ async function runRefresh() {
     return all;
   } finally {
     isRefreshing = false;
+  }
+}
+
+async function runEventsRefresh() {
+  if (isRefreshingEvents) return readJSON(EVENTS_FILE);
+  isRefreshingEvents = true;
+  console.log(`[events] Fetching @ ${new Date().toISOString()}`);
+  try {
+    const events = await fetchAllEvents();
+    writeJSON(EVENTS_FILE, events.slice(0, 150));
+    console.log(`[events] Done. ${events.length} found.`);
+    return events;
+  } finally {
+    isRefreshingEvents = false;
   }
 }
 
@@ -322,6 +376,31 @@ app.post("/api/refresh", async (req, res) => {
   res.json({ count: items.length });
 });
 
+function isEventsStale() {
+  try {
+    const stat = fs.statSync(EVENTS_FILE);
+    const hours = Number(process.env.EVENTS_FETCH_INTERVAL_HOURS || 6);
+    return Date.now() - stat.mtimeMs > hours * 60 * 60 * 1000;
+  } catch {
+    return true;
+  }
+}
+
+app.get("/api/events", async (req, res) => {
+  if (isEventsStale() && !isRefreshingEvents) {
+    await runEventsRefresh();
+  }
+  const { area } = req.query;
+  let items = readJSON(EVENTS_FILE);
+  if (area) items = items.filter((i) => i.areaId === area);
+  res.json(items);
+});
+
+app.post("/api/events/refresh", async (req, res) => {
+  const items = await runEventsRefresh();
+  res.json({ count: items.length });
+});
+
 app.post("/api/subscribe", (req, res) => {
   const { email } = req.body || {};
   if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
@@ -346,4 +425,10 @@ app.listen(PORT, () => {
   const cronExpr = `0 */${hours} * * *`;
   cron.schedule(cronExpr, runRefresh);
   console.log(`Scheduled refresh every ${hours} hour(s) (cron: "${cronExpr}")`);
+
+  runEventsRefresh(); // initial fetch on boot
+  const eventsHours = Number(process.env.EVENTS_FETCH_INTERVAL_HOURS || 6);
+  const eventsCronExpr = `0 */${eventsHours} * * *`;
+  cron.schedule(eventsCronExpr, runEventsRefresh);
+  console.log(`Scheduled events refresh every ${eventsHours} hour(s) (cron: "${eventsCronExpr}")`);
 });

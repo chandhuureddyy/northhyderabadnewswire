@@ -1,0 +1,19 @@
+{
+  "name": "north-hyd-news",
+  "version": "1.0.0",
+  "description": "Hyperlocal news aggregator for North Hyderabad (Kompally, Suchitra, Medchal, Jeedimetla and nearby areas) with email digest alerts.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.15",
+    "rss-parser": "^3.13.0"
+  }
+}

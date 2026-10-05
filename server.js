@@ -205,15 +205,140 @@ function isJunk(item) {
   return false;
 }
 
+const TITLE_STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "by", "for", "from", "has", "have",
+  "in", "into", "is", "its", "of", "on", "or", "that", "the", "their", "this",
+  "to", "was", "were", "what", "when", "where", "why", "with", "will", "after",
+  "before", "over", "under", "new", "news"
+]);
+
+function normalizeTitle(title, item = {}) {
+  let value = String(title || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  // Google News commonly appends the publisher to the headline:
+  // "Headline - Publisher". Strip that suffix when it matches the source.
+  const source = String(item.source || "")
+    .replace(/\b(news|com|in|org)\b/gi, " ")
+    .replace(/[^a-z0-9]+/gi, " ")
+    .trim();
+  const parts = value.split(/\s+[-–—|:]\s+/);
+  if (parts.length > 1 && source) {
+    const tail = parts[parts.length - 1].replace(/[^a-z0-9]+/g, " ").trim();
+    if (tail && (tail === source || tail.includes(source) || source.includes(tail))) {
+      value = parts.slice(0, -1).join(" ");
+    }
+  }
+
+  return value.replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function titleTokens(title, item = {}) {
+  return new Set(
+    normalizeTitle(title, item)
+      .split(" ")
+      .map(w => w.trim())
+      .filter(w => w.length >= 3 && !TITLE_STOPWORDS.has(w))
+  );
+}
+
+function titleSimilarity(a, b) {
+  const aa = titleTokens(a.title, a);
+  const bb = titleTokens(b.title, b);
+  if (!aa.size || !bb.size) return 0;
+  let intersection = 0;
+  for (const token of aa) if (bb.has(token)) intersection++;
+  return intersection / (aa.size + bb.size - intersection);
+}
+
+function sourceQuality(item) {
+  const providerScore = {
+    "newsapi": 40,
+    "google-cse": 35,
+    "google-news-rss": 30,
+    "bing-news-rss": 20
+  }[item.provider] || 10;
+  const haystack = `${item.source || ""} ${item.link || ""}`.toLowerCase();
+  const priority = PRIORITY_DOMAINS.some(domain => haystack.includes(domain.toLowerCase())) ? 15 : 0;
+  const generic = /bing news|google news/i.test(item.source || "") ? -5 : 0;
+  return providerScore + priority + generic;
+}
+
+function mergeDuplicate(existing, candidate) {
+  const merged = sourceQuality(candidate) > sourceQuality(existing) ? { ...candidate } : { ...existing };
+  const areaIds = new Set([
+    ...(existing.areaIds || (existing.areaId ? [existing.areaId] : [])),
+    ...(candidate.areaIds || (candidate.areaId ? [candidate.areaId] : []))
+  ]);
+  const areas = new Set([
+    ...(existing.areas || (existing.area ? [existing.area] : [])),
+    ...(candidate.areas || (candidate.area ? [candidate.area] : []))
+  ]);
+  merged.areaIds = Array.from(areaIds);
+  merged.areas = Array.from(areas);
+  merged.areaId = merged.areaIds[0] || merged.areaId;
+  merged.area = merged.areas[0] || merged.area || "North Hyderabad";
+
+  // Keep the newest publication timestamp while retaining the best source/link.
+  const times = [existing.publishedAt, candidate.publishedAt]
+    .filter(Boolean)
+    .map(v => new Date(v).getTime())
+    .filter(Number.isFinite);
+  if (times.length) merged.publishedAt = new Date(Math.max(...times)).toISOString();
+  return merged;
+}
+
 function dedupe(items) {
-  const seenKeys = new Set();
   const out = [];
+  const exact = new Map();
+
   for (const item of items) {
     if (isJunk(item)) continue;
-    const key = item.link || item.title;
-    if (!key || seenKeys.has(key)) continue;
-    seenKeys.add(key);
-    out.push(item);
+    const linkKey = item.link ? String(item.link).trim() : "";
+    const titleKey = normalizeTitle(item.title, item);
+    if (!linkKey && !titleKey) continue;
+
+    // First remove exact URL/title duplicates.
+    const existingIndex = exact.get(linkKey || titleKey);
+    if (existingIndex !== undefined) {
+      out[existingIndex] = mergeDuplicate(out[existingIndex], item);
+      continue;
+    }
+
+    // Then collapse syndicated/near-identical headlines from different sources.
+    // Require several shared meaningful words so unrelated short headlines do
+    // not get merged accidentally.
+    let duplicateIndex = -1;
+    if (titleKey) {
+      for (let i = 0; i < out.length; i++) {
+        const other = out[i];
+        const otherKey = normalizeTitle(other.title, other);
+        if (titleKey === otherKey) {
+          duplicateIndex = i;
+          break;
+        }
+        const aTokens = titleTokens(item.title, item);
+        const bTokens = titleTokens(other.title, other);
+        if (aTokens.size >= 5 && bTokens.size >= 5 && titleSimilarity(item, other) >= 0.84) {
+          duplicateIndex = i;
+          break;
+        }
+      }
+    }
+
+    if (duplicateIndex >= 0) {
+      out[duplicateIndex] = mergeDuplicate(out[duplicateIndex], item);
+      exact.set(linkKey || titleKey, duplicateIndex);
+    } else {
+      const index = out.push({
+        ...item,
+        areaIds: item.areaIds || (item.areaId ? [item.areaId] : []),
+        areas: item.areas || (item.area ? [item.area] : [])
+      }) - 1;
+      exact.set(linkKey || titleKey, index);
+    }
   }
   return out;
 }
@@ -297,7 +422,7 @@ function annotateEvents(items) {
   // The section is explicitly an UPCOMING events feed. A recent news
   // publication is not an event date. Therefore an item must contain an
   // actual event date and that date must fall within the next N days.
-  const horizonDays = Number(process.env.EVENTS_HORIZON_DAYS || 7);
+  const horizonDays = Number(process.env.EVENTS_HORIZON_DAYS || 30);
   const horizon = now + horizonDays * 24 * 60 * 60 * 1000;
 
   return items
@@ -315,8 +440,8 @@ function annotateEvents(items) {
 }
 
 async function fetchAllEvents() {
-  const freshDays = Number(process.env.EVENTS_LOOKBACK_DAYS || 14);
-  const cseDays = Math.min(freshDays, 30);
+  const freshDays = Number(process.env.EVENTS_LOOKBACK_DAYS || 45);
+  const cseDays = Math.min(freshDays, 45);
 
   const results = await mapWithConcurrency(AREAS, MAX_CONCURRENT_AREAS, async (area) => {
     const query = `${area.query} ${EVENT_KEYWORDS}`;

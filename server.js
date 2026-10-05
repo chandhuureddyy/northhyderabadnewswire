@@ -83,6 +83,7 @@ async function fetchGoogleNews(query) {
       title: item.title,
       link: item.link,
       source: (item.title && item.title.split(" - ").pop()) || "Google News",
+      snippet: item.contentSnippet || item.content || item.summary || "",
       publishedAt: item.pubDate ? new Date(item.pubDate).toISOString() : null,
       provider: "google-news-rss"
     }));
@@ -103,6 +104,7 @@ async function fetchBingNews(query) {
       title: item.title,
       link: item.link,
       source: item.source || item.creator || "Bing News",
+      snippet: item.contentSnippet || item.content || item.summary || "",
       publishedAt: item.pubDate ? new Date(item.pubDate).toISOString() : null,
       provider: "bing-news-rss"
     }));
@@ -125,6 +127,7 @@ async function fetchNewsApi(query) {
       title: a.title,
       link: a.url,
       source: a.source?.name || "NewsAPI",
+      snippet: [a.description, a.content].filter(Boolean).join(" "),
       publishedAt: a.publishedAt,
       provider: "newsapi"
     }));
@@ -190,6 +193,76 @@ function isRepeatedSourceTitle(title) {
   const parts = title.split(" - ");
   if (parts.length !== 2) return false;
   return parts[0].trim().toLowerCase() === parts[1].trim().toLowerCase();
+}
+
+// ---------- Area relevance ----------
+// Search engines can return a generic Hyderabad/India/world story for a
+// narrow area query. We must not tag such a result with the area merely
+// because that was the query that produced it. RSS/NewsAPI/CSE all expose
+// some form of article summary; use that summary plus the headline as the
+// first-pass location evidence.
+
+const BASE_AREA_ALIASES = {
+  kompally: ["kompally"],
+  suchitra: ["suchitra"],
+  bowenpally: ["bowenpally", "bowen pally"],
+  bollaram: ["bollaram", "bollarum"],
+  alwal: ["alwal"],
+  gundlapochampally: ["gundlapochampally", "gundla pochampally"],
+  dulapally: ["dulapally", "doolapally"],
+  quthbullapur: ["quthbullapur"],
+  medchal: ["medchal"],
+  shamirpet: ["shamirpet"],
+  jeedimetla: ["jeedimetla", "jeedimettla"],
+  petbasheerabad: ["petbasheerabad", "pet basheerabad", "pet-basheerabad"],
+  malkajgiri: ["malkajgiri"],
+  kandlakoya: ["kandlakoya"],
+  "medchal-district": ["medchal-malkajgiri", "medchal malkajgiri", "medchal"]
+};
+
+const AREA_ALIASES = {
+  ...BASE_AREA_ALIASES,
+  "north-hyderabad": [
+    "north hyderabad",
+    ...Object.values(BASE_AREA_ALIASES).flat()
+  ]
+};
+
+function normalizeSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function areaEvidence(item, area) {
+  const aliases = AREA_ALIASES[area.id] || [area.label.toLowerCase()];
+  const title = normalizeSearchText(item.title);
+  const snippet = normalizeSearchText(item.snippet);
+  const link = normalizeSearchText(item.link);
+  const titleHit = aliases.some(term => title.includes(normalizeSearchText(term)));
+  const snippetHit = aliases.some(term => snippet.includes(normalizeSearchText(term)));
+  const linkHit = aliases.some(term => link.includes(normalizeSearchText(term).replace(/ /g, "-")));
+  return { titleHit, snippetHit, linkHit };
+}
+
+function isRelevantToArea(item, area) {
+  // North Hyderabad general is intentionally broad, but it still needs
+  // evidence of one of our configured local areas.
+  const ev = areaEvidence(item, area);
+  if (ev.titleHit) return true;
+  if (ev.snippetHit) return true;
+  if (ev.linkHit) return true;
+
+  // If the article has no area evidence at all, do not label it with the
+  // area simply because the search engine returned it. This prevents cases
+  // such as Medchal -> Brazil election / Kerala elephant / Nobel Prize.
+  return false;
+}
+
+function filterResultsForArea(items, area) {
+  return items.filter(item => isRelevantToArea(item, area));
 }
 
 function isJunk(item) {
@@ -408,8 +481,9 @@ async function fetchAllAreas() {
       fetchGoogleNews(`${area.query} ${priorityQuerySuffix}`),
       fetchBingNews(`${area.query} ${priorityQuerySuffix}`)
     ]);
-    return [...general, ...bing, ...newsApi, ...cse, ...priorityGoogle, ...priorityBing]
-      .map((i) => ({ ...i, area: area.label, areaId: area.id }));
+    const candidates = [...general, ...bing, ...newsApi, ...cse, ...priorityGoogle, ...priorityBing];
+    const relevant = filterResultsForArea(candidates, area);
+    return relevant.map((i) => ({ ...i, area: area.label, areaId: area.id }));
   }).then(results => {
     const deduped = dedupe(results);
     const inWindow = withinDays(deduped, windowDays);
@@ -596,7 +670,13 @@ async function runRefresh() {
       await sendDigest(newItems);
     }
 
-    console.log(`[refresh] Done. ${all.length} total, ${newItems.length} new.`);
+    const byArea = all.reduce((acc, item) => {
+      for (const areaId of (item.areaIds || (item.areaId ? [item.areaId] : []))) {
+        acc[areaId] = (acc[areaId] || 0) + 1;
+      }
+      return acc;
+    }, {});
+    console.log(`[refresh] Done. ${all.length} total, ${newItems.length} new. Area counts: ${JSON.stringify(byArea)}`);
     return all;
   } finally {
     isRefreshing = false;

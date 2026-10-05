@@ -502,7 +502,9 @@ async function fetchAllAreas() {
 // drops anything that also reads as a completed action.
 
 const EVENT_KEYWORDS =
-  '("upcoming event" OR "event" OR "exhibition" OR "expo" OR "festival" OR "concert" OR "fair" OR "workshop" OR "tournament" OR "camp" OR "opening" OR "launch" OR "coming soon" OR "scheduled for" OR "to be held" OR "will be held")';
+  '("event" OR "upcoming" OR "exhibition" OR "expo" OR "festival" OR "concert" OR "fair" OR "workshop" OR "tournament" OR "camp" OR "opening" OR "launch" OR "coming soon" OR "scheduled for" OR "to be held" OR "will be held" OR dandiya OR garba OR navratri OR mela OR carnival OR celebration)';
+
+const EVENT_DATE_HINTS = '(January OR February OR March OR April OR May OR June OR July OR August OR September OR October OR November OR December)';
 
 // If a result also contains clearly-completed-action language, it's
 // describing something that already happened, regardless of which future
@@ -528,11 +530,26 @@ function isPastTense(title) {
 
 function extractEventDate(item) {
   const text = `${item.title || ''} ${item.snippet || ''}`;
-  const months = 'January|February|March|April|May|June|July|August|September|October|November|December';
-  const m = text.match(new RegExp(`\\b(${months})\\s+(\\d{1,2})(?:\\s*[-–]\\s*\\d{1,2})?,?\\s*(\\d{4})?\\b`, 'i'));
-  if (!m) return null;
-  const year = Number(m[3] || (item.publishedAt ? new Date(item.publishedAt).getFullYear() : new Date().getFullYear()));
-  const d = new Date(`${m[1]} ${m[2]}, ${year} 23:59:59`);
+  const months = 'January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec';
+  const monthFirst = new RegExp(`\\b(${months})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:\\s*[-–]\\s*\\d{1,2}(?:st|nd|rd|th)?)?,?\\s*(\\d{4})?\\b`, 'i');
+  const dayFirst = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s*(?:[-–]\\s*\\d{1,2}(?:st|nd|rd|th)?\\s*)?(?:of\\s+)?(${months})(?:,?\\s*(\\d{4}))?\\b`, 'i');
+  const numeric = text.match(/\\b(\\d{1,2})[\\/-](\\d{1,2})[\\/-](\\d{4})\\b/);
+
+  let day, monthName, year;
+  let m = text.match(monthFirst);
+  if (m) {
+    monthName = m[1]; day = Number(m[2]); year = Number(m[3] || '');
+  } else {
+    m = text.match(dayFirst);
+    if (m) {
+      day = Number(m[1]); monthName = m[2]; year = Number(m[3] || '');
+    } else if (numeric) {
+      day = Number(numeric[1]); monthName = Number(numeric[2]); year = Number(numeric[3]);
+    }
+  }
+  if (!day || !monthName) return null;
+  if (!year) year = new Date().getFullYear();
+  const d = new Date(`${monthName} ${day}, ${year} 23:59:59`);
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
@@ -558,23 +575,70 @@ function annotateEvents(items) {
     });
 }
 
+const EVENT_AREA_ALIASES = {
+  kompally: ['kompally', 'k town arena', 'k-town arena', 'ncl', 'cascade greens'],
+  suchitra: ['suchitra', 'suchitra junction'],
+  bowenpally: ['bowenpally', 'bowen pally'],
+  bollaram: ['bollaram', 'bollarum'],
+  alwal: ['alwal'],
+  gundlapochampally: ['gundlapochampally', 'gundla pochampally'],
+  dulapally: ['dulapally', 'doolapally'],
+  quthbullapur: ['quthbullapur'],
+  medchal: ['medchal'],
+  shamirpet: ['shamirpet'],
+  jeedimetla: ['jeedimetla', 'jeedimettla'],
+  petbasheerabad: ['petbasheerabad', 'pet basheerabad'],
+  malkajgiri: ['malkajgiri', 'malla reddy', 'malla reddy gardens', 'malla reddy grounds'],
+  kandlakoya: ['kandlakoya'],
+  'medchal-district': ['medchal-malkajgiri', 'medchal malkajgiri', 'medchal'],
+  'north-hyderabad': ['north hyderabad', 'kompally', 'suchitra', 'bowenpally', 'bollaram', 'alwal', 'gundlapochampally', 'dulapally', 'quthbullapur', 'medchal', 'shamirpet', 'jeedimetla', 'petbasheerabad', 'malkajgiri', 'kandlakoya', 'malla reddy']
+};
+
+function eventAreaEvidence(item, area) {
+  const aliases = EVENT_AREA_ALIASES[area.id] || [area.label.toLowerCase()];
+  const text = normalizeSearchText(`${item.title || ''} ${item.snippet || ''} ${item.link || ''}`);
+  return aliases.some(a => text.includes(normalizeSearchText(a)));
+}
+
+function isEventCandidate(item) {
+  const text = `${item.title || ''} ${item.snippet || ''}`;
+  return /event|upcoming|exhibition|expo|festival|concert|fair|workshop|tournament|camp|dandiya|garba|navratri|mela|carnival|celebration|scheduled|will be held|to be held|coming soon/i.test(text);
+}
+
 async function fetchAllEvents() {
   const freshDays = Number(process.env.EVENTS_LOOKBACK_DAYS || 45);
-  const cseDays = Math.min(freshDays, 45);
+  const eventQueries = AREAS.map(area => ({
+    area,
+    queries: [
+      `${area.query} ${EVENT_KEYWORDS} ${EVENT_DATE_HINTS}`,
+      `${area.query} dandiya garba navratri event 2026`,
+      `${area.query} exhibition expo festival concert event 2026`
+    ]
+  }));
 
-  const results = await mapWithConcurrency(AREAS, EVENT_MAX_CONCURRENT_AREAS, async (area) => {
-    const query = `${area.query} ${EVENT_KEYWORDS}`;
-    // Keep event discovery deliberately light: Google/Bing RSS are fast and
-    // resilient; only fall back to CSE when both return nothing. This avoids
-    // launching dozens of simultaneous external requests during Render cold starts.
-    const google = await fetchGoogleNews(query);
-    const bing = await fetchBingNews(query);
-    let cse = [];
-    if (!google.length && !bing.length) cse = await fetchGoogleCse(query, cseDays);
-    return [...google, ...bing, ...cse].map((i) => ({ ...i, area: area.label, areaId: area.id }));
+  const results = await mapWithConcurrency(eventQueries, EVENT_MAX_CONCURRENT_AREAS, async ({ area, queries }) => {
+    const collected = [];
+    // Google/Bing are searched with event-specific phrases instead of relying
+    // on one broad query. This catches ticket/event announcements such as
+    // Dandiya listings that don't use the word "upcoming" in the headline.
+    for (const query of queries) {
+      const [google, bing] = await Promise.all([fetchGoogleNews(query), fetchBingNews(query)]);
+      collected.push(...google, ...bing);
+    }
+
+    // Google CSE is especially useful for ticketing/event pages that Google
+    // News/Bing News do not index as news. Keep it to one targeted query per
+    // area when configured, so the normal news quota is not affected.
+    if (process.env.GOOGLE_CSE_KEY && process.env.GOOGLE_CSE_CX) {
+      const cse = await fetchGoogleCse(`${area.query} (event OR exhibition OR expo OR festival OR concert OR dandiya OR garba OR navratri) 2026`, freshDays);
+      collected.push(...cse);
+    }
+
+    const relevant = collected.filter(i => isEventCandidate(i) && eventAreaEvidence(i, area));
+    return relevant.map(i => ({ ...i, area: area.label, areaId: area.id }));
   });
 
-  const deduped = dedupe(results).filter((i) => !isPastTense(i.title));
+  const deduped = dedupe(results).filter(i => !isPastTense(`${i.title || ''} ${i.snippet || ''}`));
   const fresh = withinDays(deduped, freshDays);
   return annotateEvents(fresh);
 }

@@ -294,11 +294,22 @@ function extractEventDate(item) {
 
 function annotateEvents(items) {
   const now = Date.now();
-  return items.map(i => ({ ...i, eventDate: extractEventDate(i) }))
-    .filter(i => !i.eventDate || new Date(i.eventDate).getTime() >= now - 24 * 60 * 60 * 1000)
+  // The section is explicitly an UPCOMING events feed. A recent news
+  // publication is not an event date. Therefore an item must contain an
+  // actual event date and that date must fall within the next N days.
+  const horizonDays = Number(process.env.EVENTS_HORIZON_DAYS || 7);
+  const horizon = now + horizonDays * 24 * 60 * 60 * 1000;
+
+  return items
+    .map(i => ({ ...i, eventDate: extractEventDate(i) }))
+    .filter(i => {
+      if (!i.eventDate) return false;
+      const eventTime = new Date(i.eventDate).getTime();
+      return eventTime >= now && eventTime <= horizon;
+    })
     .sort((a, b) => {
-      const ad = a.eventDate ? new Date(a.eventDate).getTime() : Number.MAX_SAFE_INTEGER;
-      const bd = b.eventDate ? new Date(b.eventDate).getTime() : Number.MAX_SAFE_INTEGER;
+      const ad = new Date(a.eventDate).getTime();
+      const bd = new Date(b.eventDate).getTime();
       return ad - bd || new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0);
     });
 }

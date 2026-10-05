@@ -129,29 +129,17 @@ One honest limit: if none of those three have actually published anything
 that mentions the area recently, nothing will show for them — that's a
 content-availability gap, not something more querying can fix.
 
-## Upcoming in North Hyderabad (next ~7 days)
+## Upcoming in North Hyderabad (next 7 days)
 
-A second, separate feed tries to surface openings, events, and government
-notices. This is **not a structured events calendar** — there's no public
-API for "list of GHMC/HMDA events happening this week" — so this works by
-searching each area for actual future-tense phrasing ("to be inaugurated",
-"set to open", "scheduled for", "GHMC notification", etc.) rather than
-just topic keywords. Topic keywords alone (e.g. "inaugurated", "launch",
-"metro") mostly surfaced regular news, since journalism commonly uses
-present tense for things that *just* happened ("X inaugurates new
-facility" = already done, not upcoming) — the query now requires an
-actual forward-looking phrase, and anything that also reads as a
-completed action (e.g. contains "inaugurates", "was held", "completed")
-gets dropped even if it matched.
+A second, separate feed searches each area for event-related announcements.
+The dashboard only displays an item when its title/snippet contains an
+identifiable event date and that date falls between now and the next 7 days.
+Recent publication alone is never treated as an upcoming event.
 
-What this means in practice:
-- It surfaces **leads to check**, not confirmed dates — always click
-  through to the source for the actual date/venue.
-- It can miss a real event if nobody's written about it in that specific
-  phrasing yet — tightening the language for precision trades away some
-  recall.
-- It can surface an older recurring notice if it was re-published
-  recently.
+This is **not a verified calendar** — always click through to confirm the
+exact date, time, and venue. Because the event date must be visible in the
+search result text, the feed may miss an event when the publisher hides the
+date inside the article body.
 
 Refreshes on its own schedule (`EVENTS_FETCH_INTERVAL_HOURS`, default
 every 6 hours) via `/api/events`, shown in its own "Upcoming" section

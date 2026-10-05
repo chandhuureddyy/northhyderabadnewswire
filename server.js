@@ -17,6 +17,7 @@ app.use(express.static(path.join(__dirname, "public")));
 const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 9000);
 const MAX_CONCURRENT_AREAS = Math.max(1, Number(process.env.MAX_CONCURRENT_AREAS || 4));
 const REFRESH_TIMEOUT_MS = Number(process.env.REFRESH_TIMEOUT_MS || 45000);
+const EVENT_MAX_CONCURRENT_AREAS = Math.max(1, Number(process.env.EVENT_MAX_CONCURRENT_AREAS || 2));
 
 const parser = new Parser({
   headers: { "User-Agent": "Mozilla/5.0 (compatible; NorthHydNewsBot/2.0)" },
@@ -244,13 +245,14 @@ function titleTokens(title, item = {}) {
   );
 }
 
-function titleSimilarity(a, b) {
-  const aa = titleTokens(a.title, a);
-  const bb = titleTokens(b.title, b);
-  if (!aa.size || !bb.size) return 0;
+function titleSimilaritySets(a, b) {
+  if (!a.size || !b.size) return 0;
   let intersection = 0;
-  for (const token of aa) if (bb.has(token)) intersection++;
-  return intersection / (aa.size + bb.size - intersection);
+  // Iterate over the smaller set for speed.
+  const small = a.size <= b.size ? a : b;
+  const large = a.size <= b.size ? b : a;
+  for (const token of small) if (large.has(token)) intersection++;
+  return intersection / (a.size + b.size - intersection);
 }
 
 function sourceQuality(item) {
@@ -281,7 +283,6 @@ function mergeDuplicate(existing, candidate) {
   merged.areaId = merged.areaIds[0] || merged.areaId;
   merged.area = merged.areas[0] || merged.area || "North Hyderabad";
 
-  // Keep the newest publication timestamp while retaining the best source/link.
   const times = [existing.publishedAt, candidate.publishedAt]
     .filter(Boolean)
     .map(v => new Date(v).getTime())
@@ -290,39 +291,69 @@ function mergeDuplicate(existing, candidate) {
   return merged;
 }
 
+function canonicalLink(link) {
+  if (!link) return "";
+  try {
+    const u = new URL(String(link));
+    // Remove common tracking parameters so the same article isn't split by
+    // utm/ref/click identifiers.
+    for (const key of [...u.searchParams.keys()]) {
+      if (/^(utm_|ref$|referrer$|source$|ocid$|cmpid$|fbclid$|gclid$)/i.test(key)) {
+        u.searchParams.delete(key);
+      }
+    }
+    u.hash = "";
+    return u.toString().replace(/\/$/, "");
+  } catch {
+    return String(link).trim();
+  }
+}
+
 function dedupe(items) {
   const out = [];
   const exact = new Map();
+  // Inverted token index prevents the old O(n²) comparison across every
+  // collected article. Only compare an item with stories sharing meaningful
+  // title words.
+  const tokenIndex = new Map();
 
   for (const item of items) {
     if (isJunk(item)) continue;
-    const linkKey = item.link ? String(item.link).trim() : "";
+
+    const linkKey = canonicalLink(item.link);
     const titleKey = normalizeTitle(item.title, item);
     if (!linkKey && !titleKey) continue;
 
-    // First remove exact URL/title duplicates.
-    const existingIndex = exact.get(linkKey || titleKey);
+    const exactKey = titleKey ? `t:${titleKey}` : `u:${linkKey}`;
+    const urlExactKey = linkKey ? `u:${linkKey}` : "";
+    let existingIndex = exact.get(urlExactKey) ?? exact.get(exactKey);
+
     if (existingIndex !== undefined) {
-      out[existingIndex] = mergeDuplicate(out[existingIndex], item);
+      const previous = out[existingIndex];
+      out[existingIndex] = mergeDuplicate(previous, item);
       continue;
     }
 
-    // Then collapse syndicated/near-identical headlines from different sources.
-    // Require several shared meaningful words so unrelated short headlines do
-    // not get merged accidentally.
+    const itemTokens = titleTokens(item.title, item);
     let duplicateIndex = -1;
-    if (titleKey) {
-      for (let i = 0; i < out.length; i++) {
-        const other = out[i];
-        const otherKey = normalizeTitle(other.title, other);
-        if (titleKey === otherKey) {
-          duplicateIndex = i;
-          break;
-        }
-        const aTokens = titleTokens(item.title, item);
-        const bTokens = titleTokens(other.title, other);
-        if (aTokens.size >= 5 && bTokens.size >= 5 && titleSimilarity(item, other) >= 0.84) {
-          duplicateIndex = i;
+    const candidates = new Set();
+
+    // Use the rarest few title tokens as candidate keys. This keeps the
+    // comparison bounded even when thousands of feed results are collected.
+    const candidateTokens = [...itemTokens]
+      .sort((a, b) => (tokenIndex.get(a)?.size || 0) - (tokenIndex.get(b)?.size || 0))
+      .slice(0, 4);
+    for (const token of candidateTokens) {
+      for (const idx of (tokenIndex.get(token) || [])) candidates.add(idx);
+    }
+
+    if (itemTokens.size >= 5) {
+      for (const idx of candidates) {
+        const other = out[idx];
+        if (!other || !other._titleTokens) continue;
+        const otherKey = other._titleKey;
+        if (titleKey === otherKey || titleSimilaritySets(itemTokens, other._titleTokens) >= 0.84) {
+          duplicateIndex = idx;
           break;
         }
       }
@@ -330,17 +361,31 @@ function dedupe(items) {
 
     if (duplicateIndex >= 0) {
       out[duplicateIndex] = mergeDuplicate(out[duplicateIndex], item);
-      exact.set(linkKey || titleKey, duplicateIndex);
-    } else {
-      const index = out.push({
-        ...item,
-        areaIds: item.areaIds || (item.areaId ? [item.areaId] : []),
-        areas: item.areas || (item.area ? [item.area] : [])
-      }) - 1;
-      exact.set(linkKey || titleKey, index);
+      out[duplicateIndex]._titleTokens = titleTokens(out[duplicateIndex].title, out[duplicateIndex]);
+      out[duplicateIndex]._titleKey = normalizeTitle(out[duplicateIndex].title, out[duplicateIndex]);
+      if (linkKey) exact.set(urlExactKey, duplicateIndex);
+      exact.set(exactKey, duplicateIndex);
+      continue;
+    }
+
+    const stored = {
+      ...item,
+      areaIds: item.areaIds || (item.areaId ? [item.areaId] : []),
+      areas: item.areas || (item.area ? [item.area] : []),
+      _titleTokens: itemTokens,
+      _titleKey: titleKey
+    };
+    const index = out.push(stored) - 1;
+    if (linkKey) exact.set(urlExactKey, index);
+    exact.set(exactKey, index);
+    for (const token of itemTokens) {
+      if (!tokenIndex.has(token)) tokenIndex.set(token, new Set());
+      tokenIndex.get(token).add(index);
     }
   }
-  return out;
+
+  // Never expose the internal dedupe fields in API responses or persisted data.
+  return out.map(({ _titleTokens, _titleKey, ...item }) => item);
 }
 
 function withinDays(items, days) {
@@ -383,7 +428,7 @@ async function fetchAllAreas() {
 // drops anything that also reads as a completed action.
 
 const EVENT_KEYWORDS =
-  '("event" OR "exhibition" OR "expo" OR "festival" OR "concert" OR "fair" OR "sale" OR "workshop" OR "tournament" OR "camp" OR "opening" OR "launch" OR "to be inaugurated" OR "will be inaugurated" OR "set to open" OR "slated to open" OR "will open" OR "to open soon" OR "coming soon" OR "scheduled to be held" OR "scheduled for" OR "to be held" OR "will be held" OR "upcoming event" OR "public notice" OR "tender notice" OR "GHMC notification" OR "HMDA notification")';
+  '("upcoming event" OR "event" OR "exhibition" OR "expo" OR "festival" OR "concert" OR "fair" OR "workshop" OR "tournament" OR "camp" OR "opening" OR "launch" OR "coming soon" OR "scheduled for" OR "to be held" OR "will be held")';
 
 // If a result also contains clearly-completed-action language, it's
 // describing something that already happened, regardless of which future
@@ -443,13 +488,15 @@ async function fetchAllEvents() {
   const freshDays = Number(process.env.EVENTS_LOOKBACK_DAYS || 45);
   const cseDays = Math.min(freshDays, 45);
 
-  const results = await mapWithConcurrency(AREAS, MAX_CONCURRENT_AREAS, async (area) => {
+  const results = await mapWithConcurrency(AREAS, EVENT_MAX_CONCURRENT_AREAS, async (area) => {
     const query = `${area.query} ${EVENT_KEYWORDS}`;
-    const [google, bing, cse] = await Promise.all([
-      fetchGoogleNews(query),
-      fetchBingNews(query),
-      fetchGoogleCse(query, cseDays)
-    ]);
+    // Keep event discovery deliberately light: Google/Bing RSS are fast and
+    // resilient; only fall back to CSE when both return nothing. This avoids
+    // launching dozens of simultaneous external requests during Render cold starts.
+    const google = await fetchGoogleNews(query);
+    const bing = await fetchBingNews(query);
+    let cse = [];
+    if (!google.length && !bing.length) cse = await fetchGoogleCse(query, cseDays);
     return [...google, ...bing, ...cse].map((i) => ({ ...i, area: area.label, areaId: area.id }));
   });
 
@@ -595,7 +642,7 @@ app.get("/api/news", async (req, res) => {
   if (isStale() && !isRefreshing) runRefresh().catch(err => console.error('[refresh]', err.message));
   const { area } = req.query;
   let items = readJSON(LATEST_FILE);
-  if (area) items = items.filter((i) => i.areaId === area);
+  if (area) items = items.filter((i) => (i.areaIds || [i.areaId]).includes(area));
   res.json(items);
 });
 
@@ -618,7 +665,7 @@ app.get("/api/events", async (req, res) => {
   if (isEventsStale() && !isRefreshingEvents) runEventsRefresh().catch(err => console.error('[events]', err.message));
   const { area } = req.query;
   let items = readJSON(EVENTS_FILE);
-  if (area) items = items.filter((i) => i.areaId === area);
+  if (area) items = items.filter((i) => (i.areaIds || [i.areaId]).includes(area));
   res.json(items);
 });
 
@@ -645,14 +692,18 @@ app.get("/api/health", (req, res) => res.json({ ok: true, time: new Date().toISO
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`North Hyderabad News app running at http://localhost:${PORT}`);
-  runRefresh().catch(err => console.error('[startup refresh]', err.message));
+  // Let the web server become responsive before starting the first external refresh.
+  // This is especially important on Render cold starts.
+  setTimeout(() => runRefresh().catch(err => console.error('[startup refresh]', err.message)), 1500);
 
   const hours = Number(process.env.FETCH_INTERVAL_HOURS || 4);
   const cronExpr = `0 */${hours} * * *`;
   cron.schedule(cronExpr, runRefresh);
   console.log(`Scheduled refresh every ${hours} hour(s) (cron: "${cronExpr}")`);
 
-  setTimeout(() => runEventsRefresh().catch(err => console.error('[startup events]', err.message)), 5000);
+  // Never make the first page load compete with the event collector.
+  // The collector starts well after the web server is healthy.
+  setTimeout(() => runEventsRefresh().catch(err => console.error('[startup events]', err.message)), 30000);
   const eventsHours = Number(process.env.EVENTS_FETCH_INTERVAL_HOURS || 6);
   const eventsCronExpr = `0 */${eventsHours} * * *`;
   cron.schedule(eventsCronExpr, runEventsRefresh);

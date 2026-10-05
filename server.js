@@ -14,9 +14,38 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 9000);
+const MAX_CONCURRENT_AREAS = Math.max(1, Number(process.env.MAX_CONCURRENT_AREAS || 4));
+const REFRESH_TIMEOUT_MS = Number(process.env.REFRESH_TIMEOUT_MS || 45000);
+
 const parser = new Parser({
-  headers: { "User-Agent": "Mozilla/5.0 (compatible; NorthHydNewsBot/1.0)" }
+  headers: { "User-Agent": "Mozilla/5.0 (compatible; NorthHydNewsBot/2.0)" },
+  timeout: HTTP_TIMEOUT_MS
 });
+
+async function withTimeout(promise, ms = HTTP_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
+  });
+  try { return await Promise.race([promise, timeout]); }
+  finally { clearTimeout(timer); }
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function runner() {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      try { results[index] = await worker(items[index], index); }
+      catch (err) { results[index] = []; console.error('[worker]', err.message); }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runner));
+  return results.flat();
+}
 
 const DATA_DIR = path.join(__dirname, "data");
 const SEEN_FILE = path.join(DATA_DIR, "seen.json");
@@ -89,7 +118,7 @@ async function fetchNewsApi(query) {
   try {
     const resp = await axios.get("https://newsapi.org/v2/everything", {
       params: { q: query, language: "en", sortBy: "publishedAt", pageSize: 15, apiKey: key },
-      timeout: 10000
+      timeout: HTTP_TIMEOUT_MS
     });
     return (resp.data.articles || []).map((a) => ({
       title: a.title,
@@ -123,7 +152,7 @@ async function fetchGoogleCse(query, dateRestrictDays) {
         num: 10,
         dateRestrict: `d${dateRestrictDays}` // Google's own recency filter
       },
-      timeout: 10000
+      timeout: HTTP_TIMEOUT_MS
     });
     return (resp.data.items || []).map((item) => ({
       title: item.title,
@@ -197,11 +226,10 @@ function withinDays(items, days) {
 // ---------- News pipeline ----------
 
 async function fetchAllAreas() {
-  const results = [];
   const windowDays = Number(process.env.NEWS_WINDOW_DAYS || 15);
   const priorityQuerySuffix = `(site:${PRIORITY_DOMAINS.join(" OR site:")})`;
 
-  for (const area of AREAS) {
+  return mapWithConcurrency(AREAS, MAX_CONCURRENT_AREAS, async (area) => {
     const [general, bing, newsApi, cse, priorityGoogle, priorityBing] = await Promise.all([
       fetchGoogleNews(area.query),
       fetchBingNews(area.query),
@@ -210,20 +238,14 @@ async function fetchAllAreas() {
       fetchGoogleNews(`${area.query} ${priorityQuerySuffix}`),
       fetchBingNews(`${area.query} ${priorityQuerySuffix}`)
     ]);
-
-    const tagged = [...general, ...bing, ...newsApi, ...cse, ...priorityGoogle, ...priorityBing].map((i) => ({
-      ...i,
-      area: area.label,
-      areaId: area.id
-    }));
-    results.push(...tagged);
-    await new Promise((r) => setTimeout(r, 250)); // small stagger between areas
-  }
-
-  const deduped = dedupe(results);
-  const inWindow = withinDays(deduped, windowDays);
-  inWindow.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
-  return inWindow;
+    return [...general, ...bing, ...newsApi, ...cse, ...priorityGoogle, ...priorityBing]
+      .map((i) => ({ ...i, area: area.label, areaId: area.id }));
+  }).then(results => {
+    const deduped = dedupe(results);
+    const inWindow = withinDays(deduped, windowDays);
+    inWindow.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
+    return inWindow;
+  });
 }
 
 // ---------- Upcoming events pipeline ----------
@@ -236,7 +258,7 @@ async function fetchAllAreas() {
 // drops anything that also reads as a completed action.
 
 const EVENT_KEYWORDS =
-  '("to be inaugurated" OR "will be inaugurated" OR "set to open" OR "slated to open" OR "will open" OR "to open soon" OR "coming soon" OR "scheduled to be held" OR "scheduled for" OR "to be held" OR "will be held" OR "upcoming event" OR "public notice" OR "tender notice" OR "GHMC notification" OR "HMDA notification")';
+  '("event" OR "exhibition" OR "expo" OR "festival" OR "concert" OR "fair" OR "sale" OR "workshop" OR "tournament" OR "camp" OR "opening" OR "launch" OR "to be inaugurated" OR "will be inaugurated" OR "set to open" OR "slated to open" OR "will open" OR "to open soon" OR "coming soon" OR "scheduled to be held" OR "scheduled for" OR "to be held" OR "will be held" OR "upcoming event" OR "public notice" OR "tender notice" OR "GHMC notification" OR "HMDA notification")';
 
 // If a result also contains clearly-completed-action language, it's
 // describing something that already happened, regardless of which future
@@ -259,32 +281,45 @@ function isPastTense(title) {
   return PAST_TENSE_EXCLUDE.some((p) => p.test(title || ""));
 }
 
-async function fetchAllEvents() {
-  const results = [];
-  const freshDays = Number(process.env.EVENTS_LOOKBACK_DAYS || 7); // how recent the *announcement* must be
-  const cseDays = Math.min(freshDays, 15); // CSE dateRestrict is capped sensibly here too
 
-  for (const area of AREAS) {
+function extractEventDate(item) {
+  const text = `${item.title || ''} ${item.snippet || ''}`;
+  const months = 'January|February|March|April|May|June|July|August|September|October|November|December';
+  const m = text.match(new RegExp(`\\b(${months})\\s+(\\d{1,2})(?:\\s*[-–]\\s*\\d{1,2})?,?\\s*(\\d{4})?\\b`, 'i'));
+  if (!m) return null;
+  const year = Number(m[3] || (item.publishedAt ? new Date(item.publishedAt).getFullYear() : new Date().getFullYear()));
+  const d = new Date(`${m[1]} ${m[2]}, ${year} 23:59:59`);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function annotateEvents(items) {
+  const now = Date.now();
+  return items.map(i => ({ ...i, eventDate: extractEventDate(i) }))
+    .filter(i => !i.eventDate || new Date(i.eventDate).getTime() >= now - 24 * 60 * 60 * 1000)
+    .sort((a, b) => {
+      const ad = a.eventDate ? new Date(a.eventDate).getTime() : Number.MAX_SAFE_INTEGER;
+      const bd = b.eventDate ? new Date(b.eventDate).getTime() : Number.MAX_SAFE_INTEGER;
+      return ad - bd || new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0);
+    });
+}
+
+async function fetchAllEvents() {
+  const freshDays = Number(process.env.EVENTS_LOOKBACK_DAYS || 14);
+  const cseDays = Math.min(freshDays, 30);
+
+  const results = await mapWithConcurrency(AREAS, MAX_CONCURRENT_AREAS, async (area) => {
     const query = `${area.query} ${EVENT_KEYWORDS}`;
     const [google, bing, cse] = await Promise.all([
       fetchGoogleNews(query),
       fetchBingNews(query),
       fetchGoogleCse(query, cseDays)
     ]);
-
-    const tagged = [...google, ...bing, ...cse].map((i) => ({
-      ...i,
-      area: area.label,
-      areaId: area.id
-    }));
-    results.push(...tagged);
-    await new Promise((r) => setTimeout(r, 250));
-  }
+    return [...google, ...bing, ...cse].map((i) => ({ ...i, area: area.label, areaId: area.id }));
+  });
 
   const deduped = dedupe(results).filter((i) => !isPastTense(i.title));
   const fresh = withinDays(deduped, freshDays);
-  fresh.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
-  return fresh;
+  return annotateEvents(fresh);
 }
 
 // ---------- Email ----------
@@ -364,7 +399,7 @@ async function runRefresh() {
   console.log(`[refresh] Fetching news @ ${new Date().toISOString()}`);
 
   try {
-    const all = await fetchAllAreas();
+    const all = await withTimeout(fetchAllAreas(), REFRESH_TIMEOUT_MS);
     const seen = new Set(readJSON(SEEN_FILE));
     const newItems = all.filter((i) => i.link && !seen.has(i.link));
 
@@ -390,7 +425,7 @@ async function runEventsRefresh() {
   isRefreshingEvents = true;
   console.log(`[events] Fetching @ ${new Date().toISOString()}`);
   try {
-    const events = await fetchAllEvents();
+    const events = await withTimeout(fetchAllEvents(), REFRESH_TIMEOUT_MS);
     writeJSON(EVENTS_FILE, events.slice(0, 150));
     console.log(`[events] Done. ${events.length} found.`);
     return events;
@@ -419,18 +454,18 @@ app.get("/api/news", async (req, res) => {
   // So: if the cached data is older than the refresh interval, fetch fresh
   // data on-demand before responding. First visitor after a nap "wakes" the
   // feed for everyone.
-  if (isStale() && !isRefreshing) {
-    await runRefresh();
-  }
+  // Never block a page request on external search providers. Start a refresh
+  // in the background and return the last cache immediately.
+  if (isStale() && !isRefreshing) runRefresh().catch(err => console.error('[refresh]', err.message));
   const { area } = req.query;
   let items = readJSON(LATEST_FILE);
   if (area) items = items.filter((i) => i.areaId === area);
   res.json(items);
 });
 
-app.post("/api/refresh", async (req, res) => {
-  const items = await runRefresh();
-  res.json({ count: items.length });
+app.post("/api/refresh", (req, res) => {
+  if (!isRefreshing) runRefresh().catch(err => console.error('[refresh]', err.message));
+  res.status(202).json({ started: true, count: readJSON(LATEST_FILE).length });
 });
 
 function isEventsStale() {
@@ -444,18 +479,16 @@ function isEventsStale() {
 }
 
 app.get("/api/events", async (req, res) => {
-  if (isEventsStale() && !isRefreshingEvents) {
-    await runEventsRefresh();
-  }
+  if (isEventsStale() && !isRefreshingEvents) runEventsRefresh().catch(err => console.error('[events]', err.message));
   const { area } = req.query;
   let items = readJSON(EVENTS_FILE);
   if (area) items = items.filter((i) => i.areaId === area);
   res.json(items);
 });
 
-app.post("/api/events/refresh", async (req, res) => {
-  const items = await runEventsRefresh();
-  res.json({ count: items.length });
+app.post("/api/events/refresh", (req, res) => {
+  if (!isRefreshingEvents) runEventsRefresh().catch(err => console.error('[events]', err.message));
+  res.status(202).json({ started: true, count: readJSON(EVENTS_FILE).length });
 });
 
 app.post("/api/subscribe", (req, res) => {
@@ -476,14 +509,14 @@ app.get("/api/health", (req, res) => res.json({ ok: true, time: new Date().toISO
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`North Hyderabad News app running at http://localhost:${PORT}`);
-  runRefresh(); // initial fetch on boot
+  runRefresh().catch(err => console.error('[startup refresh]', err.message));
 
-  const hours = Number(process.env.FETCH_INTERVAL_HOURS || 2);
+  const hours = Number(process.env.FETCH_INTERVAL_HOURS || 4);
   const cronExpr = `0 */${hours} * * *`;
   cron.schedule(cronExpr, runRefresh);
   console.log(`Scheduled refresh every ${hours} hour(s) (cron: "${cronExpr}")`);
 
-  runEventsRefresh(); // initial fetch on boot
+  setTimeout(() => runEventsRefresh().catch(err => console.error('[startup events]', err.message)), 5000);
   const eventsHours = Number(process.env.EVENTS_FETCH_INTERVAL_HOURS || 6);
   const eventsCronExpr = `0 */${eventsHours} * * *`;
   cron.schedule(eventsCronExpr, runEventsRefresh);

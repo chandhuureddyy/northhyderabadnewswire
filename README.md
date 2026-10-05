@@ -13,9 +13,10 @@ articles show up.
   areas).
 - **Dedup**: articles are matched by link so the same story from multiple
   areas/providers doesn't show twice.
-- **Refresh**: fetches on boot, then on a cron schedule (default every 2
-  hours — change `FETCH_INTERVAL_HOURS` in `.env`). You can also hit
-  "Refresh now" on the dashboard.
+- **Refresh**: fetches on boot, then on a cron schedule (default every 4
+  hours — change `FETCH_INTERVAL_HOURS` in `.env`). API requests never wait
+  for external providers; stale data triggers a background refresh instead.
+  You can also hit "Refresh now" on the dashboard.
 - **Email alerts**: when a refresh finds articles not seen before, it emails
   a digest to whoever subscribed on the dashboard (or the `NOTIFY_TO`
   address in `.env` if nobody's subscribed yet).
@@ -82,6 +83,16 @@ the easiest path. Steps:
 6. Click **Create Web Service**. Render builds and deploys it, then gives
    you a public URL like `https://north-hyd-news.onrender.com` — that's
    your live site, reachable from any device, anywhere.
+
+### Reliability settings
+
+The server uses provider timeouts, bounded concurrency, and a refresh deadline so
+a slow Google/Bing/API response cannot keep the dashboard stuck on a loading state.
+The frontend also polls for newly cached data after a cold start. Configure:
+
+- `HTTP_TIMEOUT_MS` — per-provider timeout (default 9000ms)
+- `MAX_CONCURRENT_AREAS` — number of area searches processed at once (default 4)
+- `REFRESH_TIMEOUT_MS` — maximum duration of a complete refresh (default 45s)
 
 ### About the free tier "sleeping"
 

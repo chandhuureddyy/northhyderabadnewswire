@@ -327,10 +327,23 @@
 
 <script>
   let currentArea = "";
+  let eventsItems = [];
+  let pollTimer = null;
+
+  async function fetchJson(url, options = {}, timeoutMs = 15000){
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try{
+      const res = await fetch(url, {...options, signal: controller.signal, cache:'no-store'});
+      let data = null;
+      try { data = await res.json(); } catch {}
+      if(!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);
+      return data;
+    } finally { clearTimeout(timer); }
+  }
 
   async function loadAreas(){
-    const res = await fetch('/api/areas');
-    const areas = await res.json();
+    const areas = await fetchJson('/api/areas');
     const wrap = document.getElementById('areaChips');
     areas.forEach(a=>{
       const btn = document.createElement('button');
@@ -350,6 +363,7 @@
     document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
     btn.classList.add('active');
     loadFeed();
+    renderEvents();
   }
 
   document.querySelector('.chip[data-area=""]').onclick = function(){
@@ -364,59 +378,115 @@
     return Math.floor(diff/86400) + 'd ago';
   }
 
+  function safeLink(value){
+    try{
+      const u = new URL(value || '', window.location.origin);
+      return ['http:', 'https:'].includes(u.protocol) ? u.href : '#';
+    }catch{return '#';}
+  }
+
   function renderCard(i){
     const li = document.createElement('li');
     li.className = 'item';
-    li.innerHTML = `
-      <a href="${i.link}" target="_blank" rel="noopener">${i.title}</a>
-      ${i.snippet ? `<div class="item-snippet">${i.snippet}</div>` : ''}
-      <div class="item-meta"><span class="area-tag">${i.area}</span>${i.source || 'Source'} &middot; ${timeAgo(i.publishedAt)}</div>
-    `;
+
+    const a = document.createElement('a');
+    a.href = safeLink(i.link);
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = i.title || 'Untitled article';
+    li.appendChild(a);
+
+    if(i.snippet){
+      const snippet = document.createElement('div');
+      snippet.className = 'item-snippet';
+      snippet.textContent = i.snippet;
+      li.appendChild(snippet);
+    }
+
+    if(i.eventDate){
+      const eventMeta = document.createElement('div');
+      eventMeta.className = 'item-meta';
+      const strong = document.createElement('strong');
+      strong.textContent = 'Event date: ';
+      eventMeta.appendChild(strong);
+      eventMeta.appendChild(document.createTextNode(new Date(i.eventDate).toLocaleDateString('en-IN', {day:'numeric', month:'short', year:'numeric'})));
+      li.appendChild(eventMeta);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'item-meta';
+    const tag = document.createElement('span');
+    tag.className = 'area-tag';
+    tag.textContent = i.area || 'North Hyderabad';
+    meta.appendChild(tag);
+    meta.appendChild(document.createTextNode(` ${i.source || 'Source'} · ${timeAgo(i.publishedAt)}`));
+    li.appendChild(meta);
     return li;
   }
 
-  async function loadFeed(){
+  async function loadFeed({silent=false} = {}){
     const status = document.getElementById('statusLine');
-    status.textContent = 'Loading feed…';
-    const url = currentArea ? '/api/news?area=' + encodeURIComponent(currentArea) : '/api/news';
-    const res = await fetch(url);
-    const items = await res.json();
     const feed = document.getElementById('feed');
-    feed.innerHTML = '';
+    if(!silent) status.textContent = 'Loading feed…';
+    const url = currentArea ? '/api/news?area=' + encodeURIComponent(currentArea) : '/api/news';
+    try{
+      const items = await fetchJson(url);
+      feed.innerHTML = '';
+      if(!items.length){
+        feed.innerHTML = '<div class="empty">No cached articles yet. The server is fetching fresh news — this page will update automatically.</div>';
+        status.textContent = 'Waiting for the first news refresh…';
+      } else {
+        items.forEach(i=> feed.appendChild(renderCard(i)));
+        status.textContent = items.length + ' articles · updated ' + new Date().toLocaleTimeString('en-IN');
+      }
+    }catch(err){
+      feed.innerHTML = '<div class="empty">Could not load the news feed right now. Please try Refresh now.</div>';
+      status.textContent = 'Feed error: ' + (err.name === 'AbortError' ? 'request timed out' : err.message);
+    }
+  }
 
+  function renderEvents(){
+    const feed = document.getElementById('eventsFeed');
+    const items = currentArea ? eventsItems.filter(i => i.areaId === currentArea) : eventsItems;
+    feed.innerHTML = '';
     if(!items.length){
-      feed.innerHTML = '<div class="empty">No articles yet. Hit "Refresh now" to fetch the latest.</div>';
+      feed.innerHTML = '<div class="empty">No upcoming event announcements matched this area yet.</div>';
     } else {
       items.forEach(i=> feed.appendChild(renderCard(i)));
     }
-    status.textContent = items.length + ' articles &middot; updated ' + new Date().toLocaleTimeString('en-IN');
-    status.innerHTML = status.textContent.replace('&middot;','·');
   }
 
   async function loadEvents(){
     try{
-      const res = await fetch('/api/events');
-      const items = await res.json();
-      const feed = document.getElementById('eventsFeed');
-      feed.innerHTML = '';
-      if(!items.length){
-        feed.innerHTML = '<div class="empty">Nothing matched this week yet.</div>';
-      } else {
-        items.forEach(i=> feed.appendChild(renderCard(i)));
-      }
+      eventsItems = await fetchJson('/api/events');
+      renderEvents();
     }catch(err){
-      // events section is best-effort -- fail silently, news feed still works
+      document.getElementById('eventsFeed').innerHTML = '<div class="empty">Events are temporarily unavailable. Try refreshing later.</div>';
     }
+  }
+
+  function startPolling(){
+    clearInterval(pollTimer);
+    pollTimer = setInterval(async ()=>{
+      await loadFeed({silent:true});
+      await loadEvents();
+    }, 10000);
   }
 
   document.getElementById('refreshBtn').onclick = async ()=>{
     const btn = document.getElementById('refreshBtn');
     btn.disabled = true;
-    btn.textContent = 'Fetching…';
-    await fetch('/api/refresh', {method:'POST'});
-    await loadFeed();
-    btn.disabled = false;
-    btn.innerHTML = '&#8635; Refresh now';
+    btn.textContent = 'Refreshing…';
+    try{
+      await fetchJson('/api/refresh', {method:'POST'}, 8000);
+      await loadFeed();
+      await loadEvents();
+    }catch(err){
+      document.getElementById('statusLine').textContent = 'Refresh started or failed: ' + err.message;
+    }finally{
+      btn.disabled = false;
+      btn.innerHTML = '&#8635; Refresh now';
+    }
   };
 
   document.getElementById('subForm').onsubmit = async (e)=>{
@@ -437,8 +507,12 @@
     }
   };
 
-  loadAreas().then(loadFeed);
-  loadEvents();
+  loadAreas()
+    .then(() => Promise.all([loadFeed(), loadEvents()]))
+    .catch(err => {
+      document.getElementById('statusLine').textContent = 'Could not initialise dashboard: ' + err.message;
+    })
+    .finally(startPolling);
 </script>
 </body>
 </html>
